@@ -253,6 +253,12 @@ pub fn syncText(s: *Surface) void {
     // app would sit idle and show the commit only on the next stray frame.
     s.app.wantFrameIn(0.033);
 
+    // An orphan read (posted before focus change, then dropRead): never
+    // apply it; clear the slot so a new request can go out.
+    if (!st.read_in_flight and ime.readPending()) {
+        if (ime.takeRead()) |text| c_alloc.free(text);
+    }
+
     // A read landed: the IME's text, if it changed the mirror.
     if (st.read_in_flight) {
         if (ime.takeRead()) |text| {

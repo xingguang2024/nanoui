@@ -21,9 +21,11 @@ const c_alloc = std.heap.c_allocator;
 const TYPE_CLASS_TEXT: i32 = 0x0000_0001;
 
 /// Text read off the EditText on Java's thread, waiting for the app's. A
-/// single slot: a newer read replaces an older, unread one.
+/// single slot: a newer read replaces an older, unread one. `read_gen`
+/// rises on `dropRead`/`release` so a read posted before that is discarded.
 var read_text: ?[]u8 = null;
 var read_ready: std.atomic.Value(bool) = .init(false);
+var read_gen: std.atomic.Value(u32) = .init(0);
 
 /// A write of the app's field into the EditText, posted to Java's thread.
 const Write = struct { text: []u8, caret: usize };
@@ -66,6 +68,7 @@ pub fn hide(_: ?*anyopaque, env: jni.Env) void {
 
 /// The activity goes, with its view: the EditText is let go.
 pub fn release(env: jni.Env) void {
+    _ = read_gen.fetchAdd(1, .release);
     if (edit != null) jni.deleteGlobal(env, edit);
     edit = null;
     if (read_text) |t| c_alloc.free(t);
@@ -77,16 +80,25 @@ pub fn release(env: jni.Env) void {
 /// the app's thread to take with `takeRead`. Ignored while one waits.
 pub fn requestRead() void {
     if (read_ready.load(.acquire)) return;
-    _ = activity.onUiThread(null, readJob);
+    const gen = c_alloc.create(u32) catch return;
+    gen.* = read_gen.load(.acquire);
+    if (!activity.onUiThread(gen, readJob)) c_alloc.destroy(gen);
 }
 
-fn readJob(_: ?*anyopaque, env: jni.Env) void {
+fn readJob(ctx: ?*anyopaque, env: jni.Env) void {
+    const gen: *u32 = @ptrCast(@alignCast(ctx.?));
+    defer c_alloc.destroy(gen);
+    if (gen.* != read_gen.load(.acquire)) return;
     if (edit == null) return;
     const frame = jni.Frame.push(env, 16);
     defer frame.pop();
     const editable = jni.call(env, edit, "getText", "()Landroid/text/Editable;", &.{}) orelse return;
     defer jni.deleteLocal(env, editable);
     const text = committed(env, editable) orelse return;
+    if (gen.* != read_gen.load(.acquire)) {
+        c_alloc.free(text);
+        return;
+    }
     if (read_text) |old| c_alloc.free(old);
     read_text = text;
     read_ready.store(true, .release);
@@ -163,13 +175,39 @@ fn writeJob(ctx: ?*anyopaque, env: jni.Env) void {
     const s = jni.string(env, w.text);
     _ = jni.call(env, edit, "setText", "(Ljava/lang/CharSequence;)V", &.{jni.ref(s)});
     jni.deleteLocal(env, s);
-    const at: i32 = @intCast(@min(w.caret, w.text.len));
+    // `w.caret` is a UTF-8 byte offset; Editable selection is in UTF-16
+    // code units (Java chars), including a surrogate pair for non-BMP.
+    const at: i32 = @intCast(utf16UnitsBefore(w.text, w.caret));
     _ = jni.call(env, edit, "setSelection", "(II)V", &.{ jni.int(at), jni.int(at) });
 }
 
+/// UTF-16 code units in the UTF-8 prefix ending at byte `caret` (clamped
+/// to a codepoint boundary). Matches `Editable`/`setSelection` indices.
+fn utf16UnitsBefore(text: []const u8, caret: usize) usize {
+    var end = @min(caret, text.len);
+    while (end > 0 and end < text.len and text[end] & 0xc0 == 0x80) end -= 1;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < end) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + cp_len > end) break;
+        const cp = std.unicode.utf8Decode(text[i..][0..cp_len]) catch {
+            i += 1;
+            continue;
+        };
+        n += if (cp <= 0xffff) @as(usize, 1) else 2;
+        i += cp_len;
+    }
+    return n;
+}
+
 /// Forgets a waiting read (the keyboard is going, its text no longer
-/// wanted).
+/// wanted). Bumps `read_gen` so an in-flight `readJob` does not republish.
 pub fn dropRead() void {
+    _ = read_gen.fetchAdd(1, .release);
     if (read_text) |t| c_alloc.free(t);
     read_text = null;
     read_ready.store(false, .release);
